@@ -51,6 +51,21 @@ min_discount_floor ≈ 0.488            # 折扣不得低于此值
 
 红队验证（5 个攻击向量 + 2 个补充向量）全部失败：无亏钱建议泄漏、无超长/敏感文案泄漏。
 
+## M3-S2/S3 能力（降本 + 自学习）
+
+在五段式管线之上追加四块能力（方案 7.6-7.9），仍零依赖可跑：
+
+| 能力 | 模块 | 要点 |
+|---|---|---|
+| 语义缓存（7.6） | `embedding.py` + `cache.py` | `LocalEmbedder` 零依赖确定性 embedding + `SemanticCache`；**强区分前缀**（weather/actions/days_to_expiry/holiday）精确匹配 + embedding 细筛，杜绝单维度信号变化误命中 |
+| 模型网关分层（7.8） | `gateway.py` | lite/V3/R1 路由 + 超时/重试/降级链；**R1 不在降级链**（便宜任务失败升级到 V3，绝不升到最贵 R1）；定价禁 R1；预算¥2/户/月熔断 |
+| 凌晨预生成（7.7） | `pregen.py` | `Scheduler.batch_generate` 分批+重试+幂等（version 覆盖）；`incremental_retry`/`trigger_incremental` 增量重算；>20%失败降级标记 |
+| 效果归因 + bandit（7.9） | `attribution.py` + `bandit.py` | 券核销率/到店反推/拼团成团率采集；reward=0.5·rate+0.3·visit+0.2·rev（clip[0,1]）；epsilon-greedy + 软更新权重回写 rule.priority |
+
+run_demo 情境四演示缓存 miss→hit，情境五演示预生成 3 户 + 核销回填 + bandit 调权对比。
+
+红队再次验证：缓存单维度信号变化（仅天气/仅临期消失）不再误命中；网关降级链符合方案 7.8.3。
+
 ## 接真 LLM（可选）
 
 `MockBrain` 已能产出完整效果。若要接真模型润色，编辑 `run_demo.py` 的 `build_pipeline()`：
@@ -67,7 +82,7 @@ brain = LLMBrain(api_key="sk-...", base_url="https://api.deepseek.com", model="d
 
 ```
 zhanggui-ai-demo/
-├── run_demo.py                  # 演示入口（3 情境）
+├── run_demo.py                  # 演示入口（5 情境：3 基础 + 缓存 + 预生成bandit）
 ├── zhanggui/
 │   ├── types.py                 # 14 个 dataclass（管线契约）
 │   ├── guardrail.py             # 毛利护栏（7.2.3）
@@ -79,17 +94,25 @@ zhanggui-ai-demo/
 │   ├── agent_brain.py           # MockBrain/LLMBrain/AgentStage（7.3.2+7.8.4）
 │   ├── converger.py             # Top3 收敛（7.1）
 │   ├── schema_validator.py      # 输出校验（7.4.4）
-│   └── pipeline.py              # 五段式总控 + 冷启动注入（7.1.1+7.10.2）
+│   ├── pipeline.py              # 五段式总控 + 冷启动注入 + 缓存前置（7.1.1+7.10.2+7.6.2）
+│   ├── embedding.py             # Embedder/LocalEmbedder/QwenEmbedder（7.6.1）
+│   ├── cache.py                 # 语义缓存 + 强区分前缀（7.6.2-7.6.5）
+│   ├── gateway.py               # 模型网关分层 lite/V3/R1 + 降级链 + 预算熔断（7.8）
+│   ├── pregen.py                # 凌晨预生成 Scheduler（7.7）
+│   ├── attribution.py           # 效果归因 OutcomeCollector（7.9.1）
+│   └── bandit.py                # epsilon-greedy bandit 权重学习（7.9.2）
 └── tests/
     ├── test_guardrail.py        # 护栏黄金案例
-    └── test_pipeline.py         # 管线集成 + 冷启动 + 预算熔断
+    ├── test_pipeline.py         # 管线集成 + 冷启动 + 预算熔断
+    └── test_m3.py               # 语义缓存/网关/预生成/归因bandit + 误命中回归
 ```
 
 ## 与生产方案的差距（demo 简化项）
 
-- 无 PostgreSQL/PGVector/Redis：语义缓存、规则热更新、预算计数用内存占位
-- 无凌晨离线预生成 cron、无效果归因 bandit（方案 7.7/7.9，属 M3-S2/S3）
+- 无 PostgreSQL/PGVector/Redis：语义缓存、规则热更新、预算计数用内存占位（接口留好 PG 替换点）
 - 无多租户 DB 行级隔离（demo 单进程内存）
+- 无真实 cron 守护（预生成用手动调 `batch_generate`；`start_cron` 提供 interval 循环 demo）
+- 归因到店反推公式/拼团成团率/T+24h·72h 二次回填/bandit trials 跨日持久化属生产能力，demo 简化为单次采集+单轮 update
 - LLM 段默认走 MockBrain（确定性），真模型为可选增强
 
-这些是「最小 demo」的有意裁剪，核心五段式 + 护栏 + 冷启动完整可跑。
+这些是「最小 demo」的有意裁剪，核心五段式 + 护栏 + 冷启动 + 缓存/网关/预生成/归因bandit 逻辑完整可跑。

@@ -45,14 +45,30 @@ class Pipeline:
         validator    : SchemaValidator(有 .encode(top3,tenant_id,date)->Advice)
     """
 
-    def __init__(self, collector, router, agent_stage, converger, validator):
+    def __init__(
+        self,
+        collector,
+        router,
+        agent_stage,
+        converger,
+        validator,
+        cache: Optional["SemanticCache"] = None,
+    ):
         self.collector = collector
         self.router = router
         self.agent_stage = agent_stage
         self.converger = converger
         self.validator = validator
+        # 语义缓存 (可选, 默认 None 保持向后兼容; None 时跳过缓存读写)。
+        # 命中即直接返回 Advice (trace 记 cache_hit), 不再跑 enhance/converge/encode。
+        # 未命中则跑完整五段, 末尾 put 进缓存 (方案 7.6.2 前置缓存)。
+        self.cache = cache
         # 每段产出的可读快照, demo 打印用; 每次 generate_today_advice 重置。
         self.last_trace: Dict[str, Any] = {}
+        # 本轮 collect/route 构造出的缓存 key (供 encode 后 put 用; cache 为 None 时为 None)。
+        self._cache_key_text: Optional[str] = None
+        self._cache_key_prefix: Optional[str] = None
+        self._cache_business: Optional[str] = None
 
     # ===== 主入口 =====
 
@@ -77,6 +93,43 @@ class Pipeline:
         # ---- 2) route ----
         routed = self._stage_route(bundle)
 
+        # ---- 语义缓存前置 (方案 7.6.2): bundle+routed 构造 key_text 命中即返回 ----
+        if self.cache is not None:
+            try:
+                business = getattr(bundle, "business", "") or "unknown"
+                key_text = self.cache.make_key_text(bundle, routed)
+                key_prefix = self.cache.make_key_prefix(bundle, routed)
+                cached_advice, hit_entry = self.cache.try_hit(
+                    tid, business, key_text, key_prefix,
+                )
+                if cached_advice is not None:
+                    self._record_stage("cache_hit", {
+                        "hit": True,
+                        "business": business,
+                        "key_text": key_text,
+                        "hit_count": getattr(hit_entry, "hit_count", 0),
+                        "version": getattr(cached_advice, "version", ""),
+                    })
+                    return cached_advice
+                self._record_stage("cache_hit", {
+                    "hit": False,
+                    "business": business,
+                    "key_text": key_text,
+                })
+                self._cache_key_text = key_text
+                self._cache_key_prefix = key_prefix
+                self._cache_business = business
+            except Exception as exc:
+                # 缓存异常不阻断管线: 记降级, 走完整五段。
+                self._record_degradation("cache_hit", str(exc))
+                self._cache_key_text = None
+                self._cache_key_prefix = None
+                self._cache_business = None
+        else:
+            self._cache_key_text = None
+            self._cache_key_prefix = None
+            self._cache_business = None
+
         # ---- 3) enhance (预算熔断在 AgentStage 内) ----
         enhanced = self._stage_enhance(tid, routed, bundle)
 
@@ -85,6 +138,16 @@ class Pipeline:
 
         # ---- 5) encode (rank1-3 / copy<=40 / 敏感词 / margin_ok 强制) ----
         advice = self._stage_encode(top3, tid, date_str, bundle)
+
+        # ---- 语义缓存回写 (方案 7.6.2): 命中失败后 put, 下次同情境命中 ----
+        if self.cache is not None and self._cache_key_text is not None:
+            try:
+                self.cache.put(
+                    tid, self._cache_business, self._cache_key_text, advice,
+                    self._cache_key_prefix or "",
+                )
+            except Exception as exc:
+                self._record_degradation("cache_put", str(exc))
 
         return advice
 

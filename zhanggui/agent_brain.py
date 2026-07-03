@@ -485,12 +485,16 @@ class LLMBrain:
         api_key: Optional[str] = None,
         base_url: Optional[str] = None,
         model: Optional[str] = None,
+        gateway: Optional[Any] = None,
     ):
-        if not api_key:
+        if not api_key and gateway is None:
             raise ValueError("LLMBrain needs api_key")
-        self.api_key = api_key
+        self.api_key = api_key or ""
         self.base_url = (base_url or self._DEFAULT_BASE_URL).rstrip("/")
         self.model = model or self._DEFAULT_MODEL
+        # 可选模型网关 (方案 7.8): 注入后 _chat 走 gateway.chat_with_tools,
+        # 享受分层选层/超时重试/层间降级/月成本熔断; 不注入则走原 urllib 直连。
+        self.gateway = gateway
         # 复用 MockBrain 做 tool 结果回灌后的兜底解析 / 护栏兜底。
         self._mock = MockBrain()
 
@@ -575,7 +579,26 @@ class LLMBrain:
     # ---- HTTP 调用 (urllib, 不 import openai) ----
 
     def _chat(self, messages: List[Dict[str, Any]], tools: Optional[List] = None) -> Dict[str, Any]:
-        """调 /chat/completions, 超时 3s。失败抛 -> 上层降级。"""
+        """调 /chat/completions, 超时 3s。失败抛 -> 上层降级。
+
+        注入 gateway 时走 gateway.chat_with_tools (分层/重试/降级/熔断统一),
+        否则走原 urllib 直连。两种路径最终都把响应归一成 openai choices 结构。
+        """
+        if self.gateway is not None:
+            # 走模型网关: 用 copy_polish 任务类型 (enhance 主要是文案/params 润色),
+            # 享受 lite->v3->r1 降级链; 网关最底层失败抛 -> 本方法抛 -> AgentStage
+            # 降级 MockBrain。tools schema 透传。
+            from .gateway import ChatMessage, ChatResp
+            chat_msgs = [
+                ChatMessage(
+                    role=m.get("role", "user"),
+                    content=m.get("content") or "",
+                    tool_calls=m.get("tool_calls"),
+                )
+                for m in messages
+            ]
+            resp = self.gateway.chat_with_tools("copy_polish", chat_msgs, tools=tools)
+            return self._gateway_resp_to_openai(resp)
         url = self.base_url + "/chat/completions"
         payload: Dict[str, Any] = {
             "model": self.model,
@@ -612,6 +635,22 @@ class LLMBrain:
         if isinstance(choices, list) and choices:
             return choices[0]
         return None
+
+    @staticmethod
+    def _gateway_resp_to_openai(resp: Any) -> Dict[str, Any]:
+        """把网关 ChatResp 归一成 openai choices 结构, 供 _first_choice/_parse_final 复用。
+
+        网关返回的 content 可能是模型直接给的最终 JSON 文案 (无 tool_calls),
+        也可能带 tool_calls (此时上层 _enhance_one_llm 的 tool-calling 循环会继续)。
+        """
+        if isinstance(resp, dict):
+            return resp
+        # ChatResp dataclass: content / tool_calls / raw
+        msg: Dict[str, Any] = {"role": "assistant", "content": getattr(resp, "content", "") or ""}
+        tc = getattr(resp, "tool_calls", None)
+        if tc:
+            msg["tool_calls"] = tc
+        return {"choices": [{"message": msg, "raw": getattr(resp, "raw", {}) or {}}]}
 
     # ---- tool 执行与回灌 ----
 
@@ -712,15 +751,32 @@ class AgentStage:
         brain: Brain,
         budget_cny: float = 2.0,
         monthly_cost: float = 0.0,
+        gateway: Optional[Any] = None,
     ):
         # brain 可为 MockBrain / LLMBrain; 内部保证有兜底 MockBrain。
         self.brain = brain
         self.budget_cny = float(budget_cny)
         self.monthly_cost = float(monthly_cost)
+        # 可选模型网关 (方案 7.8): 注入后预算熔断用 gateway.is_budget_exceeded
+        # (按月累计, 跨进程内存; 优于本类 monthly_cost 单值), 并把 gateway 下发给
+        # LLMBrain 使其 _chat 走网关分层/重试/降级。无 gateway 时保持原状。
+        self.gateway = gateway
+        if gateway is not None and isinstance(brain, LLMBrain) and brain.gateway is None:
+            brain.gateway = gateway
         self._fallback = MockBrain()
 
     def is_budget_exceeded(self, tenant_id: int) -> bool:
-        """超预算熔断 (方案 7.8.4: monthly_cost >= MonthlyLimitCNY)。"""
+        """超预算熔断 (方案 7.8.4: monthly_cost >= MonthlyLimitCNY)。
+
+        注入 gateway 时优先用 gateway.is_budget_exceeded(tenant_id) (按月累计计数,
+        与 add_cost 对齐); 否则用本类 monthly_cost 单值 (向后兼容)。
+        """
+        if self.gateway is not None:
+            try:
+                return bool(self.gateway.is_budget_exceeded(int(tenant_id or 0)))
+            except Exception:
+                # 网关预算查询异常: 回退到 monthly_cost 单值判定, 不阻断。
+                pass
         return self.monthly_cost >= self.budget_cny
 
     def enhance_or_skip(
