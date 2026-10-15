@@ -29,7 +29,7 @@ Signal Collector → Rule Router(毛利护栏) → LLM-Agent(tool-calling) → C
 ## 运行
 
 ```bash
-cd /Users/liningwei/Selfproj/zhanggui-ai-demo
+cd zhanggui-ai-demo
 python3 run_demo.py          # 跑 3 个情境，打印五段 trace + 今日3件事
 python3 -m unittest tests.test_guardrail tests.test_pipeline -v   # 9 个测试
 ```
